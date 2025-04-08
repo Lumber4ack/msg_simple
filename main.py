@@ -1,5 +1,8 @@
 import socket
 import json
+import hashlib
+import threading
+import queue
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import dh
@@ -11,12 +14,14 @@ from os import urandom
 
 
 
-HOST, PORT = "192.168.0.4", 9999
+HOST, PORT = "100.111.207.45", 9999
+
+stop_threads = False
 
 def send_message(sock, command, message, key):
     """Send a message to the server."""
     res = json.dumps({"command": command,"message": message}, separators=(',', ':'))
-    res = encrypt_message(key, res)
+    #res = encrypt_message(key, res)
     sock.sendall(res)
 
 def encrypt_message(key, plaintext):
@@ -40,12 +45,6 @@ def decrypt_message(key, ciphertext):
     plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
     return plaintext.decode()
 
-
-# Perform DH key exchange
-#parameters = dh.generate_parameters(generator=2, key_size=2048)
-#private_key = parameters.generate_private_key()
-#public_key = private_key.public_key()
-
 # Perform DH key exchange
 def check_file(parameters):
     try:
@@ -53,15 +52,6 @@ def check_file(parameters):
     except OSError:
         print("Private key not found, generating new one.")
         # Generate a new private key
-        parameters = dh.generate_parameters(generator=2, key_size=2048)
-        with open("dh_parameters.pem", "wb") as f:
-            f.write(
-               parameters.parameter_bytes(
-                   encoding=serialization.Encoding.PEM,
-                   format=serialization.ParameterFormat.PKCS3  # PKCS3 is the standard format
-               )
-            )
-
         private_key = parameters.generate_private_key()
         public_key = private_key.public_key()
         # Save the private key to a file
@@ -93,50 +83,103 @@ def check_file(parameters):
     
     return private_key, public_key
 
+
+def sending_message(sock, aes_key):
+    global stop_threads
+    while not stop_threads:
+        try:
+            ## Get message from user
+            usr = input("\nEnter username to write to: ")
+            while True:
+                message = input()
+                ## Check if user wants to quit
+                if message.lower() == 'quit':
+                    send_message(sock, "logout","ZERO", aes_key)
+                    print("Closing connection...")
+                    stop_threads = True
+                    break
+                ## Send message
+                send_message(sock, "send_msg", {"to":usr,"message":message}, aes_key)
+        except Exception as e:
+            print(f"Error sending message: {e}")
+            stop_threads = True
+            break
+def recv_message(sock, aes_key):
+    global stop_threads
+    while not stop_threads:
+        ## Get message from user
+        try:
+            encrypted_data = sock.recv(4096)
+            if not encrypted_data:
+                print("Server closed the connection.")
+                stop_threads = True
+                break
+            #decrypted_msg = decrypt_message(aes_key, encrypted_data)
+            decrypted_msg = encrypted_data
+            strct = json.loads(decrypted_msg)
+            if strct["command"] == "receive_msg":
+                print(f"( {strct['from']} ): {strct['message']}")
+            elif strct["command"] == "error":
+                print(f"\nError: {strct['message']}",flush=True)
+        except Exception as e:
+            print(f"Error receiving message: {e}")
+            stop_threads = True
+            break
+
+message_queue = queue.Queue()
+
 # Create a socket (SOCK_STREAM means a TCP socket)
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-    # Connect to server and send data
-    sock.connect((HOST, PORT))
+    try:
+        # Connect to server and send data
+        sock.connect((HOST, PORT))
 
-    server_public_key = sock.recv(4096).rstrip()
-    server_public_key = serialization.load_pem_public_key(server_public_key)
+        server_public_key = sock.recv(4096).rstrip()
+        server_public_key = serialization.load_pem_public_key(server_public_key)
 
-    private_key, public_key = check_file(server_public_key.parameters())
+        private_key, public_key = check_file(server_public_key.parameters())
 
-    public_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    
-    sock.sendall(public_bytes)
+        public_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
 
-    shared_key = private_key.exchange(server_public_key)
-    print(f"Shared secret is {shared_key.hex()}")
+        sock.sendall(public_bytes)
 
-    aes_key = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,  # 256-bit AES key
-        salt=None,
-        info=b'handshake data',
-    ).derive(shared_key)
+        shared_key = private_key.exchange(server_public_key)
+        print(f"Shared secret is {shared_key.hex()}")
 
-    while True:
-        ## Get message from user
+        aes_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,  # 256-bit AES key
+            salt=None,
+            info=b'handshake data',
+        ).derive(shared_key)
 
-        message = input("\nEnter message to send (or 'quit' to exit): ")
-        ## Check if user wants to quit
-        if message.lower() == 'quit':
-            print("Closing connection...")
-            send_message(sock, "exit", "closing connection", aes_key)
-            break
-        ## Send message
-        send_message(sock, "send_msg", message, aes_key)
+        opt = input("\nReguister or login? (r/l): ")
+        if opt.lower() == 'r':
+            name = input("\nEnter name: ")
+            send_message(sock, "check_name", "", aes_key)
+            password = input("Enter password: ")
+            password = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            send_message(sock, "register", {"username": name, "password":password}, aes_key)
+        elif opt.lower() == 'l':
+            name = input("\nEnter name: ")
+            password = input("Enter password: ")
+            password = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            send_message(sock, "login", {"username": name, "password":password}, aes_key)
+        else:
+            print("Invalid input, please enter 'r' or 'l'.")
 
-        ## Receive response
-        #response = sock.recv(1024)
-        #print(f"Response from server: {response.decode()}")
-    #sock.sendall(bytes(data, "utf-8"))
-    #sock.sendall(b"\n")
+        threading.Thread(target=recv_message, args=(sock, aes_key), daemon=True).start()
+        threading.Thread(target=sending_message, args=(sock, aes_key), daemon=True).start()
 
-    # Receive data from the server and shut down
-    #received = str(sock.recv(1024), "utf-8")
+        while not stop_threads:
+            pass
+
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        stop_threads = True
+        sock.close()
+        print("Socket closed.")
